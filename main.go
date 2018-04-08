@@ -6,167 +6,19 @@ import (
 	"bytes"
 	"net"
 	"math/rand"
-	"crypto/sha256"
 	"fmt"
 	"os"
 	"errors"
 )
 
-const (
-	magic = uint32(0xD9B4BEF9)
-
-	maxCommandLength = 12
-	payloadChecksumLength = 4
-	nonceLength = 8
-)
-
-type payload interface {
-	Serialize() []byte
-}
-
-type versionPayload struct {
-	version     uint32
-	timestamp   uint64
-	ipRecv      net.IP
-	portRecv    uint16
-	ipFrom      net.IP
-	portFrom    uint16
-	nonce       uint64
-	startHeight uint32
-}
-
-func newVersionPayload(ipRecv net.IP, portRecv uint16, ipFrom net.IP, portFrom uint16, startHeight uint32) versionPayload {
-	return versionPayload{
-		version:     70015,
-		timestamp:   uint64(time.Now().Unix()),
-		ipRecv:      ipRecv,
-		portRecv:    portRecv,
-		ipFrom:      ipFrom,
-		portFrom:    portFrom,
-		nonce:       rand.Uint64(),
-		startHeight: startHeight,
-	}
-}
-
-func (v versionPayload) Serialize() []byte {
-	var buf bytes.Buffer
-	binary.Write(&buf, binary.LittleEndian, v.version)
-	binary.Write(&buf, binary.LittleEndian, uint64(0))
-	binary.Write(&buf, binary.LittleEndian, v.timestamp)
-
-	var addrServices = uint64(0)
-	binary.Write(&buf, binary.LittleEndian, addrServices)
-	binary.Write(&buf, binary.BigEndian, v.ipRecv)
-	binary.Write(&buf, binary.BigEndian, v.portRecv)
-	binary.Write(&buf, binary.LittleEndian, addrServices)
-	binary.Write(&buf, binary.BigEndian, v.ipFrom)
-	binary.Write(&buf, binary.BigEndian, v.portFrom)
-	binary.Write(&buf, binary.LittleEndian, v.nonce)
-
-	userAgentBytes := []byte("go")
-	userAgentLen := encodeVariableLengthInt(uint64(len(userAgentBytes)))
-	binary.Write(&buf, binary.LittleEndian, userAgentLen)
-	binary.Write(&buf, binary.LittleEndian, userAgentBytes)
-
-	binary.Write(&buf, binary.LittleEndian, v.startHeight)
-
-	relay := false
-	binary.Write(&buf, binary.LittleEndian, relay)
-
-	return buf.Bytes()
-}
-
-func encodeVariableLengthInt(i uint64) []byte {
-	var buf bytes.Buffer
-	if i < 0xFD {
-		binary.Write(&buf, binary.LittleEndian, uint8(i))
-	} else if i <= 0xFFFF {
-		binary.Write(&buf, binary.LittleEndian, 0xFD)
-		binary.Write(&buf, binary.LittleEndian, uint16(i))
-	} else if i <= 0xFFFFFFFF {
-		binary.Write(&buf, binary.LittleEndian, 0xFE)
-		binary.Write(&buf, binary.LittleEndian, uint32(i))
-	} else {
-		binary.Write(&buf, binary.LittleEndian, 0xFF)
-		binary.Write(&buf, binary.LittleEndian, uint64(i))
-	}
-	return buf.Bytes()
-}
-
-type message struct {
-	command string
-	payload payload
-}
-
-func newMessage(command string, p payload) message {
-	return message{
-		command: command,
-		payload: p,
-	}
-}
-
-func (m message) Serialize() []byte {
-	var buf bytes.Buffer
-
-	binary.Write(&buf, binary.LittleEndian, magic)
-
-	var commandBytes [maxCommandLength]byte
-	copy(commandBytes[:], m.command)
-	binary.Write(&buf, binary.LittleEndian, commandBytes)
-
-	payloadBytes := m.payload.Serialize()
-
-	binary.Write(&buf, binary.LittleEndian, uint32(len(payloadBytes)))
-
-	checksum := checksum(payloadBytes)
-	binary.Write(&buf, binary.LittleEndian, checksum)
-
-	binary.Write(&buf, binary.LittleEndian, m.payload.Serialize())
-
-	return buf.Bytes()
-}
-
-func checksum(bytes []byte) []byte {
-	return dhash(bytes)[0:payloadChecksumLength]
-}
-
-func dhash(bytes []byte) []byte {
-	hashInternal := sha256.New()
-	hashInternal.Write(bytes)
-	hashExternal := sha256.New()
-	hashExternal.Write(hashInternal.Sum(nil))
-	return hashExternal.Sum(nil)
-}
-
-func getSeedIpAddress() (net.IP, error) {
-	var seeds = []string{
-		"seed.bitcoin.sipa.be",
-		"dnsseed.bluematt.me",
-		"dnsseed.bitcoin.dashjr.org",
-		"seed.bitcoinstats.com",
-		"seed.bitcoin.jonasschnelli.ch",
-		"seed.btc.petertodd.org",
-		"seed.bitcoin.sprovoost.nl"}
-	var seed = seeds[rand.Intn(len(seeds))]
-	fmt.Println("Seed:", seed)
-
-	ips, err := net.LookupIP(seed)
-	if err != nil {
-		return nil, err
-	}
-
-	var ip = ips[rand.Intn(len(ips))]
-	return ip, nil
-}
-
-type messageHeader struct {
+type receivedMessageHeader struct {
 	command string
 	length uint32
 	checksum []byte
 }
 
-func readMessageHeader(buf *bytes.Buffer) (*messageHeader, error) {
-	var header = new(messageHeader)
+func readMessageHeader(buf *bytes.Buffer) (*receivedMessageHeader, error) {
+	var header = new(receivedMessageHeader)
 
 	var recvMagic uint32
 	err := binary.Read(buf, binary.LittleEndian, &recvMagic)
@@ -179,7 +31,7 @@ func readMessageHeader(buf *bytes.Buffer) (*messageHeader, error) {
 	}
 
 	// Read command
-	var commandBytes = make([]byte, maxCommandLength, maxCommandLength)
+	var commandBytes = make([]byte, maxCommandLen, maxCommandLen)
 	err = binary.Read(buf, binary.LittleEndian, &commandBytes)
 	if err != nil {
 		return nil, err
@@ -188,7 +40,6 @@ func readMessageHeader(buf *bytes.Buffer) (*messageHeader, error) {
 	if err != nil {
 		return nil, errors.New(fmt.Sprintf("cannot decode command: %s", err.Error()))
 	}
-	fmt.Printf("Command: %s\n", command)
 	header.command = command
 
 	if command != "version" {
@@ -201,16 +52,14 @@ func readMessageHeader(buf *bytes.Buffer) (*messageHeader, error) {
 	if err != nil {
 		return nil, errors.New(fmt.Sprintf("cannot read payload length: %s", err.Error()))
 	}
-	fmt.Printf("Payload length: %d\n", payloadLen)
 	header.length = payloadLen
 
 	// Read payload checksum
-	var payloadChecksumBytes = make([]byte, payloadChecksumLength, payloadChecksumLength)
+	var payloadChecksumBytes = make([]byte, payloadChecksumLen, payloadChecksumLen)
 	err = binary.Read(buf, binary.LittleEndian, &payloadChecksumBytes)
 	if err != nil {
 		return nil, err
 	}
-	fmt.Printf("Payload checksum: % x\n", payloadChecksumBytes)
 	header.checksum = payloadChecksumBytes
 
 	return header, nil
@@ -234,115 +83,129 @@ func decodeNullTerminatedString(bytes []byte) (string, error) {
 	}
 }
 
-func decodeVersionPayload(header *messageHeader, buf *bytes.Buffer) error {
+func decodeVersionPayload(header *receivedMessageHeader, buf *bytes.Buffer) (*versionPayload, error) {
 	var payloadBytes = make([]byte, header.length, header.length)
 	err := binary.Read(buf, binary.LittleEndian, &payloadBytes)
 	if err != nil {
-		return errors.New(fmt.Sprintf("cannot read payload: %s", err.Error()))
+		return nil, errors.New(fmt.Sprintf("cannot read payload: %s", err.Error()))
 	}
 
-	var actualChecksum = checksum(payloadBytes)
-	if !bytes.Equal(actualChecksum, header.checksum) {
-		return errors.New("incorrect checksum")
+	if !verifyChecksum(payloadBytes, header.checksum) {
+		return nil, errors.New("incorrect checksum")
 	}
 
 	var payloadBuf = bytes.NewBuffer(payloadBytes)
 	return decodeVersionPayloadAfterCheck(payloadBuf)
 }
 
-func decodeVersionPayloadAfterCheck(buf *bytes.Buffer) error {
+func decodeVersionPayloadAfterCheck(buf *bytes.Buffer) (*versionPayload, error) {
+	var result = new(versionPayload)
+
 	// Read protocol version
-	var protocolVersion uint32
-	err := binary.Read(buf, binary.LittleEndian, &protocolVersion)
+	err := binary.Read(buf, binary.LittleEndian, &result.version)
 	if err != nil {
-		return errors.New(fmt.Sprintf("cannot decode protocol version: %s", err.Error()))
+		return nil, errors.New(fmt.Sprintf("cannot decode protocol version: %s", err.Error()))
 	}
-	fmt.Printf("Protocol version: %d\n", protocolVersion)
 
 	// Read node services
-	var services = make([]byte, 8, 8)
-	err = binary.Read(buf, binary.LittleEndian, &services)
+	result.services = make([]byte, servicesLen, servicesLen)
+	err = binary.Read(buf, binary.LittleEndian, &result.services)
 	if err != nil {
-		return errors.New(fmt.Sprintf("cannot decode services: %s", err.Error()))
+		return nil, errors.New(fmt.Sprintf("cannot decode services: %s", err.Error()))
 	}
-	fmt.Printf("Node services: % x\n", services)
 
 	// Read node timestamp
-	var timestamp uint64
-	err = binary.Read(buf, binary.LittleEndian, &timestamp)
+	err = binary.Read(buf, binary.LittleEndian, &result.timestamp)
 	if err != nil {
-		return errors.New(fmt.Sprintf("cannot decode timestamp: %s", err.Error()))
+		return nil, errors.New(fmt.Sprintf("cannot decode timestamp: %s", err.Error()))
 	}
-	fmt.Printf("Node timestamp: %d == %s\n", timestamp, time.Unix(int64(timestamp), 0))
 
-	servicesRecv, ipRecv, portRecv, err := decodeNodeServicesAddressAndPort(buf)
+	servicesRecv, err := decodeNodeServices(buf)
 	if err != nil {
-		return errors.New(fmt.Sprintf("cannot decode receiving node address: %s", err.Error()))
+		return nil, errors.New(fmt.Sprintf("cannot decode receiving node address: %s", err.Error()))
 	}
-	fmt.Printf("Receiving node services: % x\n", servicesRecv)
-	fmt.Printf("Receiving node IP and port: %s:%d\n", ipRecv, portRecv)
-
-	servicesEmit, ipEmit, portEmit, err := decodeNodeServicesAddressAndPort(buf)
+	ipRecv, err := decodeNodeAddress(buf)
 	if err != nil {
-		return errors.New(fmt.Sprintf("cannot decode receiving node address: %s", err.Error()))
+		return nil, errors.New(fmt.Sprintf("cannot decode receiving node address: %s", err.Error()))
 	}
-	fmt.Printf("Emitting node services: % x\n", servicesEmit)
-	fmt.Printf("Emitting node IP and port: %s:%d\n", ipEmit, portEmit)
-
-	var nonce = make([]byte, nonceLength, nonceLength)
-	err = binary.Read(buf, binary.LittleEndian, &nonce)
+	portRecv, err := decodeNodePort(buf)
 	if err != nil {
-		return errors.New(fmt.Sprintf("cannot decode nonce: %s", err.Error()))
+		return nil, errors.New(fmt.Sprintf("cannot decode receiving node address: %s", err.Error()))
 	}
-	fmt.Printf("Nonce: % x\n", nonce)
 
-	userAgent, err := decodeUserAgent(buf)
+	result.servicesRecv = servicesRecv
+	result.ipRecv = ipRecv
+	result.portRecv = portRecv
+
+	servicesFrom, err := decodeNodeServices(buf)
 	if err != nil {
-		return errors.New(fmt.Sprintf("cannot decode user agent: %s", err.Error()))
+		return nil, errors.New(fmt.Sprintf("cannot decode receiving node address: %s", err.Error()))
 	}
-	fmt.Printf("User agent: %s\n", userAgent)
-
-	var height uint32
-	err = binary.Read(buf, binary.LittleEndian, &height)
+	ipFrom, err := decodeNodeAddress(buf)
 	if err != nil {
-		return errors.New(fmt.Sprintf("cannot decode block start height: %s", err.Error()))
+		return nil, errors.New(fmt.Sprintf("cannot decode receiving node address: %s", err.Error()))
 	}
-	fmt.Printf("Block start height: %d\n", height)
-
-	var relay bool
-	err = binary.Read(buf, binary.LittleEndian, &relay)
+	portFrom, err := decodeNodePort(buf)
 	if err != nil {
-		return errors.New(fmt.Sprintf("cannot decode relay flag: %s", err.Error()))
+		return nil, errors.New(fmt.Sprintf("cannot decode receiving node address: %s", err.Error()))
 	}
-	fmt.Printf("Relay flag: %t\n", relay)
 
-	return nil
+	result.servicesFrom = servicesFrom
+	result.ipFrom = ipFrom
+	result.portFrom = portFrom
+
+	err = binary.Read(buf, binary.LittleEndian, &result.nonce)
+	if err != nil {
+		return nil, errors.New(fmt.Sprintf("cannot decode nonce: %s", err.Error()))
+	}
+
+	result.userAgent, err = decodeUserAgent(buf)
+	if err != nil {
+		return result, errors.New(fmt.Sprintf("cannot decode user agent: %s", err.Error()))
+	}
+
+	err = binary.Read(buf, binary.LittleEndian, &result.startHeight)
+	if err != nil {
+		return nil, errors.New(fmt.Sprintf("cannot decode block start height: %s", err.Error()))
+	}
+
+	err = binary.Read(buf, binary.LittleEndian, &result.relay)
+	if err != nil {
+		return nil, errors.New(fmt.Sprintf("cannot decode relay flag: %s", err.Error()))
+	}
+
+	return result, nil
 }
 
-func decodeNodeServicesAddressAndPort(buf *bytes.Buffer) ([]byte, net.IP, uint16, error) {
-	// Read node services
-	var services = make([]byte, 8, 8)
-	var ip net.IP
-	var port = uint16(0)
-
+func decodeNodeServices(buf *bytes.Buffer) ([]byte, error) {
+	var services = make([]byte, servicesLen, servicesLen)
 	err := binary.Read(buf, binary.LittleEndian, &services)
 	if err != nil {
-		return services, ip, port, errors.New(fmt.Sprintf("cannot read services: %s", err.Error()))
+		return services, errors.New(fmt.Sprintf("cannot read services: %s", err.Error()))
 	}
+	return services, nil
+}
+
+func decodeNodeAddress(buf *bytes.Buffer) (net.IP, error) {
+	var ip net.IP
 
 	var ipArr = make([]byte, net.IPv6len, net.IPv6len)
-	err = binary.Read(buf, binary.BigEndian, &ipArr)
+	err := binary.Read(buf, binary.BigEndian, &ipArr)
 	if err != nil {
-		return services, ip, port, errors.New(fmt.Sprintf("cannot read IP: %s", err.Error()))
+		return ip, errors.New(fmt.Sprintf("cannot read IP: %s", err.Error()))
 	}
 	ip = net.IP(ipArr)
 
-	err = binary.Read(buf, binary.BigEndian, &port)
-	if err != nil {
-		return services, ip, port, errors.New(fmt.Sprintf("cannot read port: %s", err.Error()))
-	}
+	return ip, nil
+}
 
-	return services, ip, port, nil
+func decodeNodePort(buf *bytes.Buffer) (uint16, error) {
+	var port = uint16(0)
+	err := binary.Read(buf, binary.BigEndian, &port)
+	if err != nil {
+		return port, errors.New(fmt.Sprintf("cannot read port: %s", err.Error()))
+	}
+	return port, nil
 }
 
 func decodeUserAgent(buf *bytes.Buffer) (string, error) {
@@ -350,7 +213,7 @@ func decodeUserAgent(buf *bytes.Buffer) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	fmt.Printf("User agent length: %d\n", length)
+	// fmt.Printf("User agent length: %d\n", length)
 
 	uaArr := make([]byte, length, length)
 	err = binary.Read(buf, binary.LittleEndian, &uaArr)
@@ -395,8 +258,6 @@ func readVariableLengthInt(buf *bytes.Buffer) (uint64, error) {
 }
 
 func main() {
-	const bitcoinPort = 8333
-
 	rand.Seed(time.Now().Unix())
 
 	var ipSeed, err = getSeedIpAddress()
@@ -410,18 +271,18 @@ func main() {
 	ipFrom := net.IPv4(127, 0, 0, 1)
 
 	startHeight := uint32(0)
-	payload := newVersionPayload(ipRecv, bitcoinPort, ipFrom, bitcoinPort, startHeight)
+	payload := newVersionPayload(ipRecv, bitcoinPort, ipFrom, bitcoinPort, "go", startHeight, false)
 	message := newMessage("version", payload)
 
 	connectTo := fmt.Sprintf("%s:%d", ipRecv, bitcoinPort)
 	fmt.Println("Connecting to", connectTo)
 
 	conn, err := net.Dial("tcp", connectTo)
-	defer conn.Close()
 	if err != nil {
 		fmt.Println(err)
 		os.Exit(1)
 	}
+	defer conn.Close()
 
 	fmt.Println("Connected, sending version message")
 
@@ -434,40 +295,68 @@ func main() {
 	recvArr := make([]byte, 1024, 1024)
 	recvBuf := bytes.NewBuffer(make([]byte, 0, 1024))
 	var readingHeader = true
-	var header *messageHeader = nil
+	var header *receivedMessageHeader = nil
 	for true {
+		if readingHeader {
+			recvBuf.Reset()
+		}
+
 		readBytes, err := conn.Read(recvArr)
 		if err != nil {
-			fmt.Println(err)
+			fmt.Printf("Error reading bytes: %s\n", err)
 			os.Exit(1)
 		}
 		// fmt.Printf("Read %d bytes\n", readBytes)
 		recvBuf.Write(recvArr[:readBytes])
 
-		if readingHeader {
-			if recvBuf.Len() >= 24 {
-				header, err = readMessageHeader(recvBuf)
-				if err != nil {
-					fmt.Println(err)
-					os.Exit(1)
-				}
-				// fmt.Println(header)
-
-				readingHeader = false
-			}
-		} else {
-			if uint32(recvBuf.Len()) >= header.length {
-				switch header.command {
-				case "version":
-					err = decodeVersionPayload(header, recvBuf)
+		for true {
+			// fmt.Println("Available1:", recvBuf.Len())
+			if readingHeader {
+				if recvBuf.Len() >= 24 {
+					header, err = readMessageHeader(recvBuf)
 					if err != nil {
-						fmt.Println(err)
+						fmt.Printf("Error reading header: %s\n", err)
 						os.Exit(1)
 					}
-				}
+					// fmt.Println("Available2:", recvBuf.Len())
+					fmt.Println(header)
+					// fmt.Printf("Command: %s\n", header.command)
+					// fmt.Printf("Payload length: %d\n", header.length)
+					// fmt.Printf("Payload checksum: % x\n", header.checksum)
 
-				readingHeader = true
-				header = nil
+					readingHeader = false
+				} else {
+					break
+				}
+			} else {
+				if uint32(recvBuf.Len()) >= header.length {
+					switch header.command {
+					case "version":
+						payload, err := decodeVersionPayload(header, recvBuf)
+						if err != nil {
+							fmt.Printf("Error reading payload: %s\n", err)
+							os.Exit(1)
+						}
+						// fmt.Println("Available2:", recvBuf.Len())
+						fmt.Println(payload)
+						// fmt.Printf("Protocol version: %d\n", payload.version)
+						// fmt.Printf("Node services: % x\n", payload.services)
+						// fmt.Printf("Node timestamp: %d == %s\n", payload.timestamp, time.Unix(int64(payload.timestamp), 0))
+						// fmt.Printf("Receiving node services: % x\n", payload.servicesRecv)
+						// fmt.Printf("Receiving node IP and port: %s:%d\n", ipRecv, payload.portRecv)
+						// fmt.Printf("Emitting node services: % x\n", payload.servicesFrom)
+						// fmt.Printf("Emitting node IP and port: %s:%d\n", ipFrom, payload.portFrom)
+						// fmt.Printf("Nonce: %d\n", payload.nonce)
+						// fmt.Printf("User agent: %s\n", payload.userAgent)
+						// fmt.Printf("Block start height: %d\n", payload.startHeight)
+						// fmt.Printf("Relay flag: %t\n", payload.relay)
+					}
+
+					readingHeader = true
+					header = nil
+				} else {
+					break
+				}
 			}
 		}
 	}
